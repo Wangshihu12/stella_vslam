@@ -250,7 +250,7 @@ protected:
 
     //! current camera pose from reference keyframe
     //! (to update last camera pose at the beginning of each tracking)
-    Mat44_t last_cam_pose_from_ref_keyfrm_;
+    Mat44_t last_cam_pose_from_ref_keyfrm_; // 参考关键帧到当前帧的相对姿态
 
     //-----------------------------------------
     // management for stop_keyframe_insertion process
@@ -293,8 +293,10 @@ protected:
     //! Finish update request. Returns true in case of request was made.
     void finish_relocalize_by_pose_request();
     //! Indicator of update pose request
+    // 是否有重定位请求被发起
     bool relocalize_by_pose_is_requested_ = false;
     //! Requested pose to update
+    // 当前重定位对象
     pose_request relocalize_by_pose_request_;
 };
 

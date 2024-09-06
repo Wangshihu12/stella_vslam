@@ -21,17 +21,17 @@ namespace stella_vslam {
 
 tracking_module::tracking_module(const std::shared_ptr<config>& cfg, camera::base* camera, data::map_database* map_db,
                                  data::bow_vocabulary* bow_vocab, data::bow_database* bow_db)
-    : camera_(camera),
-      tracking_yaml_(util::yaml_optional_ref(cfg->yaml_node_, "Tracking")),
-      reloc_distance_threshold_(tracking_yaml_["reloc_distance_threshold"].as<double>(0.2)),
-      reloc_angle_threshold_(tracking_yaml_["reloc_angle_threshold"].as<double>(0.45)),
-      init_retry_threshold_time_(tracking_yaml_["init_retry_threshold_time"].as<double>(5.0)),
-      enable_auto_relocalization_(tracking_yaml_["enable_auto_relocalization"].as<bool>(true)),
-      enable_temporal_keyframe_only_tracking_(tracking_yaml_["enable_temporal_keyframe_only_tracking"].as<bool>(false)),
-      use_robust_matcher_for_relocalization_request_(tracking_yaml_["use_robust_matcher_for_relocalization_request"].as<bool>(false)),
-      max_num_local_keyfrms_(tracking_yaml_["max_num_local_keyfrms"].as<unsigned int>(60)),
-      margin_local_map_projection_(tracking_yaml_["margin_local_map_projection"].as<float>(5.0)),
-      margin_local_map_projection_unstable_(tracking_yaml_["margin_local_map_projection_unstable"].as<float>(20.0)),
+    : camera_(camera),      // 相机模型
+      tracking_yaml_(util::yaml_optional_ref(cfg->yaml_node_, "Tracking")),     // 配置文件
+      reloc_distance_threshold_(tracking_yaml_["reloc_distance_threshold"].as<double>(0.2)),    // 重定位距离阈值
+      reloc_angle_threshold_(tracking_yaml_["reloc_angle_threshold"].as<double>(0.45)),         // 重定位角度阈值
+      init_retry_threshold_time_(tracking_yaml_["init_retry_threshold_time"].as<double>(5.0)),  // 初始化重试时间阈值
+      enable_auto_relocalization_(tracking_yaml_["enable_auto_relocalization"].as<bool>(true)), // 是否启用自动重定位
+      enable_temporal_keyframe_only_tracking_(tracking_yaml_["enable_temporal_keyframe_only_tracking"].as<bool>(false)),    // 是否仅对时间关键帧进行跟踪
+      use_robust_matcher_for_relocalization_request_(tracking_yaml_["use_robust_matcher_for_relocalization_request"].as<bool>(false)),  // 重定位请求是否使用鲁棒匹配器
+      max_num_local_keyfrms_(tracking_yaml_["max_num_local_keyfrms"].as<unsigned int>(60)),         // 局部关键帧的最大数量
+      margin_local_map_projection_(tracking_yaml_["margin_local_map_projection"].as<float>(5.0)),   // 局部地图投影的边距
+      margin_local_map_projection_unstable_(tracking_yaml_["margin_local_map_projection_unstable"].as<float>(20.0)),    // 不稳定时局部地图投影的边距
       map_db_(map_db), bow_vocab_(bow_vocab), bow_db_(bow_db),
       initializer_(map_db, bow_db, util::yaml_optional_ref(cfg->yaml_node_, "Initializer")),
       pose_optimizer_(optimize::pose_optimizer_factory::create(tracking_yaml_)),
@@ -45,27 +45,32 @@ tracking_module::~tracking_module() {
     spdlog::debug("DESTRUCT: tracking_module");
 }
 
+// 设置跟踪模块和映射模块，更新关键帧插入器
 void tracking_module::set_mapping_module(mapping_module* mapper) {
     mapper_ = mapper;
     keyfrm_inserter_.set_mapping_module(mapper);
 }
 
+// 设置全局优化模块
 void tracking_module::set_global_optimization_module(global_optimization_module* global_optimizer) {
     global_optimizer_ = global_optimizer;
 }
 
+// 发起一个基于给定位姿的重定位请求，在跟踪失败后，根据外部信息提供的位姿来重定位
 bool tracking_module::request_relocalize_by_pose(const Mat44_t& pose_cw) {
     std::lock_guard<std::mutex> lock(mtx_relocalize_by_pose_request_);
+    // 如果有重定位工作正在进行，返回 false
     if (relocalize_by_pose_is_requested_) {
         spdlog::warn("Can not process new pose update request while previous was not finished");
         return false;
     }
-    relocalize_by_pose_is_requested_ = true;
+    relocalize_by_pose_is_requested_ = true;    // 表示一个重定位请求已经被发起
     relocalize_by_pose_request_.mode_2d_ = false;
     relocalize_by_pose_request_.pose_cw_ = pose_cw;
     return true;
 }
 
+// 发起一个基于给定位姿和法向量的2D重定位请求
 bool tracking_module::request_relocalize_by_pose_2d(const Mat44_t& pose_cw, const Vec3_t& normal_vector) {
     std::lock_guard<std::mutex> lock(mtx_relocalize_by_pose_request_);
     if (relocalize_by_pose_is_requested_) {
@@ -79,50 +84,67 @@ bool tracking_module::request_relocalize_by_pose_2d(const Mat44_t& pose_cw, cons
     return true;
 }
 
+// 检查当前是否有基于位姿的重定位请求正在等待处理
 bool tracking_module::relocalize_by_pose_is_requested() {
     std::lock_guard<std::mutex> lock(mtx_relocalize_by_pose_request_);
     return relocalize_by_pose_is_requested_;
 }
 
+// 提供对当前重定位对象的访问
 pose_request& tracking_module::get_relocalize_by_pose_request() {
     std::lock_guard<std::mutex> lock(mtx_relocalize_by_pose_request_);
     return relocalize_by_pose_request_;
 }
 
+// 结束重定位请求
 void tracking_module::finish_relocalize_by_pose_request() {
     std::lock_guard<std::mutex> lock(mtx_relocalize_by_pose_request_);
     relocalize_by_pose_is_requested_ = false;
 }
 
+// 重置跟踪模块
 void tracking_module::reset() {
     spdlog::info("resetting system");
 
+    // 系统初始化和关键帧插入器的重置
     initializer_.reset();
     keyfrm_inserter_.reset();
 
+    // 调用映射模块的异步重置，然后使用 get 等待这些线程完成
     auto future_mapper_reset = mapper_->async_reset();
     auto future_global_optimizer_reset = global_optimizer_->async_reset();
     future_mapper_reset.get();
     future_global_optimizer_reset.get();
 
+    // 清理词袋数据和地图数据
     bow_db_->clear();
     map_db_->clear();
 
+    // 上次重定位的 id 和时间戳
     last_reloc_frm_id_ = 0;
     last_reloc_frm_timestamp_ = 0.0;
 
     tracking_state_ = tracker_state_t::Initializing;
 }
 
+// 处理传入的帧数据，更新系统的跟踪状态，返回相机在世界坐标系中的位姿
 std::shared_ptr<Mat44_t> tracking_module::feed_frame(data::frame curr_frm) {
     // check if pause is requested
+    // 检查是否需要暂停
     pause_if_requested();
     while (is_paused()) {
         std::this_thread::sleep_for(std::chrono::microseconds(5000));
     }
 
+    // 更新当前帧
     curr_frm_ = curr_frm;
 
+    // 根据当前状态判断初始化还是跟踪
+    // 跟踪逻辑：
+    // 锁定互斥量以防止在跟踪过程中插入关键帧。
+    // 判断是否需要重定位。
+    // 调用track函数进行帧跟踪。
+    // 检查是否需要插入新的关键帧
     bool succeeded = false;
     if (tracking_state_ == tracker_state_t::Initializing) {
         succeeded = initialize();
@@ -137,12 +159,14 @@ std::shared_ptr<Mat44_t> tracking_module::feed_frame(data::frame curr_frm) {
         succeeded = track(relocalization_is_needed, num_tracked_lms, num_reliable_lms, min_num_obs_thr);
 
         // check to insert the new keyframe derived from the current frame
+        // 判断是否插入关键帧
         if (succeeded && !is_stopped_keyframe_insertion_ && new_keyframe_is_needed(num_tracked_lms, num_reliable_lms, min_num_obs_thr)) {
             keyfrm_inserter_.insert_new_keyframe(map_db_, curr_frm_);
         }
     }
 
     // state transition
+    // 根据是否跟踪成功转换状态
     if (succeeded) {
         tracking_state_ = tracker_state_t::Tracking;
     }
@@ -158,15 +182,18 @@ std::shared_ptr<Mat44_t> tracking_module::feed_frame(data::frame curr_frm) {
         }
     }
 
+    // 计算并返回相机在世界坐标系中的位姿
     std::shared_ptr<Mat44_t> cam_pose_wc = nullptr;
     // store the relative pose from the reference keyframe to the current frame
     // to update the camera pose at the beginning of the next tracking process
     if (curr_frm_.pose_is_valid()) {
+        // 参考关键帧到当前帧的相对姿态
         last_cam_pose_from_ref_keyfrm_ = curr_frm_.get_pose_cw() * curr_frm_.ref_keyfrm_->get_pose_wc();
         cam_pose_wc = std::allocate_shared<Mat44_t>(Eigen::aligned_allocator<Mat44_t>(), curr_frm_.get_pose_wc());
     }
 
     // update last frame
+    // 当前帧赋值给上一帧
     SPDLOG_TRACE("tracking_module: update last frame (curr_frm_={})", curr_frm_.id_);
     {
         std::lock_guard<std::mutex> lock(mtx_last_frm_);
@@ -177,10 +204,11 @@ std::shared_ptr<Mat44_t> tracking_module::feed_frame(data::frame curr_frm) {
     return cam_pose_wc;
 }
 
-bool tracking_module::track(bool relocalization_is_needed,
-                            unsigned int& num_tracked_lms,
-                            unsigned int& num_reliable_lms,
-                            const unsigned int min_num_obs_thr) {
+// 处理帧跟踪过程，包括是否需要重定位、执行跟踪、更新局部地图和位姿优化等
+bool tracking_module::track(bool relocalization_is_needed,          // 是否需要重定位
+                            unsigned int& num_tracked_lms,          // 跟踪到的地图点的数量
+                            unsigned int& num_reliable_lms,         // 储存可靠的地图点的数量
+                            const unsigned int min_num_obs_thr) {   // 最小观测数量阈值
     // LOCK the map database
     std::lock_guard<std::mutex> lock1(data::map_database::mtx_database_);
     std::lock_guard<std::mutex> lock2(mtx_last_frm_);
@@ -188,21 +216,26 @@ bool tracking_module::track(bool relocalization_is_needed,
     // update the camera pose of the last frame
     // because the mapping module might optimize the camera pose of the last frame's reference keyframe
     SPDLOG_TRACE("tracking_module: update the camera pose of the last frame (curr_frm_={})", curr_frm_.id_);
+    // 更新上一帧的位姿
     update_last_frame();
 
     // set the reference keyframe of the current frame
+    // 把上一帧初参考关键帧设置为当前帧参考关键帧
     curr_frm_.ref_keyfrm_ = last_frm_.ref_keyfrm_;
 
     bool succeeded = false;
     if (relocalize_by_pose_is_requested()) {
         // Force relocalization by pose
+        // 如果有重定位请求，根据位姿重定位
         succeeded = relocalize_by_pose(get_relocalize_by_pose_request());
     }
     else if (!relocalization_is_needed) {
         SPDLOG_TRACE("tracking_module: track_current_frame (curr_frm_={})", curr_frm_.id_);
+        // 如果不需要重定位，直接跟踪当前帧
         succeeded = track_current_frame();
     }
     else if (enable_auto_relocalization_) {
+        // 如果启用了自动重定位，则计算词袋模型，然后尝试重定位
         // Compute the BoW representations to perform relocalization
         SPDLOG_TRACE("tracking_module: Compute the BoW representations to perform relocalization (curr_frm_={})", curr_frm_.id_);
         if (!curr_frm_.bow_is_available()) {
@@ -218,6 +251,7 @@ bool tracking_module::track(bool relocalization_is_needed,
     }
 
     // update the local map and optimize current camera pose
+    // 更新局部地图，优化当前帧的位姿
     unsigned int fixed_keyframe_id_threshold = map_db_->get_fixed_keyframe_id_threshold();
     unsigned int num_temporal_keyfrms = 0;
     if (succeeded) {
@@ -230,42 +264,50 @@ bool tracking_module::track(bool relocalization_is_needed,
     }
 
     // update the motion model
+    // 更新运动模型
     if (succeeded) {
         SPDLOG_TRACE("tracking_module: update_motion_model (curr_frm_={})", curr_frm_.id_);
         update_motion_model();
     }
 
     // update the frame statistics
+    // 更新当前帧的统计信息
     SPDLOG_TRACE("tracking_module: update_frame_statistics (curr_frm_={})", curr_frm_.id_);
     map_db_->update_frame_statistics(curr_frm_, !succeeded);
 
     return succeeded;
 }
 
-bool tracking_module::track_local_map(unsigned int& num_tracked_lms,
-                                      unsigned int& num_reliable_lms,
-                                      unsigned int& num_temporal_keyfrms,
-                                      const unsigned int min_num_obs_thr,
-                                      const unsigned int fixed_keyframe_id_threshold) {
+// 处理局部地图跟踪过程，包括更新局部地图、搜索局部地标和优化当前帧的位姿
+bool tracking_module::track_local_map(unsigned int& num_tracked_lms,        // 存储跟踪到的地图点的数量
+                                      unsigned int& num_reliable_lms,       // 存储可靠的地图点的数量
+                                      unsigned int& num_temporal_keyfrms,   // 存储临时关键帧的数量
+                                      const unsigned int min_num_obs_thr,   // 最小观测数量阈值
+                                      const unsigned int fixed_keyframe_id_threshold) {     // 固定关键帧的ID阈值
+    // 首先更新局部地图，可能包括插入新的关键帧、优化关键帧的位姿和添加新的地图点，然后返回跟踪是否成功，以及时间关键帧的数量
     bool succeeded = false;
     SPDLOG_TRACE("tracking_module: update_local_map (curr_frm_={})", curr_frm_.id_);
     succeeded = update_local_map(fixed_keyframe_id_threshold, num_temporal_keyfrms);
 
     if (succeeded) {
+        // 如果更新局部地图成功，搜索匹配的地图点
         succeeded = search_local_landmarks(fixed_keyframe_id_threshold);
     }
 
+    // 优化当前位姿
     if (succeeded) {
         SPDLOG_TRACE("tracking_module: optimize_current_frame_with_local_map (curr_frm_={})", curr_frm_.id_);
         succeeded = optimize_current_frame_with_local_map(num_tracked_lms, num_reliable_lms, min_num_obs_thr);
     }
 
+    // 返回跟踪状态
     if (!succeeded) {
         spdlog::info("local map tracking failed (curr_frm_={})", curr_frm_.id_);
     }
     return succeeded;
 }
 
+// 不使用临时关键帧的局部地图跟踪
 bool tracking_module::track_local_map_without_temporal_keyframes(unsigned int& num_tracked_lms,
                                                                  unsigned int& num_reliable_lms,
                                                                  const unsigned int min_num_obs_thr,
@@ -290,6 +332,7 @@ bool tracking_module::track_local_map_without_temporal_keyframes(unsigned int& n
     return succeeded;
 }
 
+// 使用当前帧尝试初始化、处理初始化失败的情况以及将关键帧传递给映射模块
 bool tracking_module::initialize() {
     {
         // LOCK the map database
@@ -312,6 +355,7 @@ bool tracking_module::initialize() {
     }
 
     // pass all of the keyframes to the mapping module
+    // 传递关键帧给映射模块
     assert(!is_stopped_keyframe_insertion_);
     for (const auto& keyfrm : curr_frm_.ref_keyfrm_->graph_node_->get_keyframes_from_root()) {
         auto future = mapper_->async_add_keyframe(keyfrm);
@@ -322,14 +366,18 @@ bool tracking_module::initialize() {
     return true;
 }
 
+// 跟踪当前帧
 bool tracking_module::track_current_frame() {
     bool succeeded = false;
 
     // Tracking mode
+    // 如果运动模型有效，则根据当前帧与上一帧的运动模型来跟踪
     if (twist_is_valid_) {
         // if the motion model is valid
         succeeded = frame_tracker_.motion_based_track(curr_frm_, last_frm_, twist_);
     }
+
+    // 如果运动模型跟踪失败，则计算词袋模型，根据词袋来匹配
     if (!succeeded) {
         // Compute the BoW representations to perform the BoW match
         if (!curr_frm_.bow_is_available()) {
@@ -337,6 +385,8 @@ bool tracking_module::track_current_frame() {
         }
         succeeded = frame_tracker_.bow_match_based_track(curr_frm_, last_frm_, curr_frm_.ref_keyfrm_);
     }
+
+    // 如果两种方式都失败，则用基于鲁棒的匹配来跟踪
     if (!succeeded) {
         succeeded = frame_tracker_.robust_match_based_track(curr_frm_, last_frm_, curr_frm_.ref_keyfrm_);
     }
@@ -344,20 +394,27 @@ bool tracking_module::track_current_frame() {
     return succeeded;
 }
 
+// 基于给定位姿重定位
 bool tracking_module::relocalize_by_pose(const pose_request& request) {
     bool succeeded = false;
+    // 设置当前帧的位姿
     curr_frm_.set_pose_cw(request.pose_cw_);
 
+    // 如果词袋不可用，计算词袋模型
     if (!curr_frm_.bow_is_available()) {
         curr_frm_.compute_bow(bow_vocab_);
     }
+
+    // 获取候选关键帧
     const auto candidates = get_close_keyframes(request);
     for (const auto& candidate : candidates) {
         spdlog::debug("relocalize_by_pose: candidate = {}", candidate->id_);
     }
 
+    // 如果候选关键帧不为空，尝试使用这些关键帧俩进行重定位
     if (!candidates.empty()) {
         succeeded = relocalizer_.reloc_by_candidates(curr_frm_, candidates, use_robust_matcher_for_relocalization_request_);
+        // 如果重定位成功，记录重定位帧的 id 和时间戳
         if (succeeded) {
             last_reloc_frm_id_ = curr_frm_.id_;
             last_reloc_frm_timestamp_ = curr_frm_.timestamp_;
@@ -366,12 +423,16 @@ bool tracking_module::relocalize_by_pose(const pose_request& request) {
         }
     }
     else {
+        // 设置当前帧为无效
         curr_frm_.invalidate_pose();
     }
+
+    // 结束重定位请求
     finish_relocalize_by_pose_request();
     return succeeded;
 }
 
+// 从地图数据库中获取最近的关键帧
 std::vector<std::shared_ptr<data::keyframe>> tracking_module::get_close_keyframes(const pose_request& request) {
     if (request.mode_2d_) {
         return map_db_->get_close_keyframes_2d(
@@ -388,6 +449,7 @@ std::vector<std::shared_ptr<data::keyframe>> tracking_module::get_close_keyframe
     }
 }
 
+// 更新运动模型，即当前帧与上一帧的运动关系，储存在 twist_ 中
 void tracking_module::update_motion_model() {
     if (last_frm_.pose_is_valid()) {
         Mat44_t last_frm_cam_pose_wc = Mat44_t::Identity();
@@ -402,8 +464,10 @@ void tracking_module::update_motion_model() {
     }
 }
 
+// 在当前帧的观察中替换地标点，更新 上一帧的地标
 void tracking_module::replace_landmarks_in_last_frm(nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>& replaced_lms) {
     std::lock_guard<std::mutex> lock(mtx_last_frm_);
+    // 遍历观察到的地标，检查是否有映射关系在 replaced_lms 中，如果有，将旧地标替换为新地标
     for (unsigned int idx = 0; idx < last_frm_.frm_obs_.undist_keypts_.size(); ++idx) {
         const auto& lm = last_frm_.get_landmark(idx);
         if (!lm) {
@@ -420,6 +484,7 @@ void tracking_module::replace_landmarks_in_last_frm(nondeterministic::unordered_
     }
 }
 
+// 更新上一帧的相机位姿
 void tracking_module::update_last_frame() {
     auto last_ref_keyfrm = last_frm_.ref_keyfrm_;
     if (!last_ref_keyfrm) {
