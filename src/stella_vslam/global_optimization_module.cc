@@ -40,11 +40,13 @@ void global_optimization_module::set_mapping_module(mapping_module* mapper) {
     loop_bundle_adjuster_->set_mapping_module(mapper);
 }
 
+// 启用回环检测器
 void global_optimization_module::enable_loop_detector() {
     spdlog::info("enable loop detector");
     loop_detector_->enable_loop_detector();
 }
 
+// 禁用回环检测
 void global_optimization_module::disable_loop_detector() {
     spdlog::info("disable loop detector");
     loop_detector_->disable_loop_detector();

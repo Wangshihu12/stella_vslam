@@ -35,9 +35,11 @@ system::system(const std::shared_ptr<config>& cfg, const std::string& vocab_file
     print_info();
 
     // load ORB vocabulary
+    // 加载 ORB 词袋
     spdlog::info("loading ORB vocabulary: {}", vocab_file_path);
     bow_vocab_ = data::bow_vocabulary_util::load(vocab_file_path);
 
+    // 加载参数
     const auto system_params = util::yaml_optional_ref(cfg->yaml_node_, "System");
 
     camera_ = camera::camera_factory::create(util::yaml_optional_ref(cfg->yaml_node_, "Camera"));
@@ -45,6 +47,7 @@ system::system(const std::shared_ptr<config>& cfg, const std::string& vocab_file
     spdlog::info("load orb_params \"{}\"", orb_params_->name_);
 
     // database
+    // 创建数据库
     cam_db_ = new data::camera_database();
     cam_db_->add_camera(camera_);
     map_db_ = new data::map_database(system_params["min_num_shared_lms"].as<unsigned int>(15));
@@ -53,6 +56,7 @@ system::system(const std::shared_ptr<config>& cfg, const std::string& vocab_file
     orb_params_db_->add_orb_params(orb_params_);
 
     // frame and map publisher
+    // 创建帧发布和地图发布器
     frame_publisher_ = std::shared_ptr<publish::frame_publisher>(new publish::frame_publisher(cfg_, map_db_));
     map_publisher_ = std::shared_ptr<publish::map_publisher>(new publish::map_publisher(cfg_, map_db_));
 
@@ -68,6 +72,7 @@ system::system(const std::shared_ptr<config>& cfg, const std::string& vocab_file
     global_optimizer_ = new global_optimization_module(map_db_, bow_db_, bow_vocab_, cfg_->yaml_node_, camera_->setup_type_ != camera::setup_type_t::Monocular);
 
     // preprocessing modules
+    // 创建预处理模块
     const auto preprocessing_params = util::yaml_optional_ref(cfg->yaml_node_, "Preprocessing");
     if (camera_->setup_type_ == camera::setup_type_t::RGBD) {
         depthmap_factor_ = preprocessing_params["depthmap_factor"].as<double>(depthmap_factor_);
@@ -97,6 +102,7 @@ system::system(const std::shared_ptr<config>& cfg, const std::string& vocab_file
     }
 
     // connect modules each other
+    // 连接各个模块
     tracker_->set_mapping_module(mapper_);
     tracker_->set_global_optimization_module(global_optimizer_);
     mapper_->set_tracking_module(tracker_);
@@ -140,6 +146,7 @@ system::~system() {
     spdlog::debug("DESTRUCT: system");
 }
 
+// 打印信息
 void system::print_info() {
     std::ostringstream message_stream;
 
@@ -162,6 +169,7 @@ void system::print_info() {
     spdlog::info(message_stream.str());
 }
 
+// 启动系统
 void system::startup(const bool need_initialize) {
     spdlog::info("startup SLAM system");
     system_is_running_ = true;
@@ -174,6 +182,7 @@ void system::startup(const bool need_initialize) {
     global_optimization_thread_ = std::unique_ptr<std::thread>(new std::thread(&stella_vslam::global_optimization_module::run, global_optimizer_));
 }
 
+// 停止系统
 void system::shutdown() {
     // terminate the other threads
     auto future_mapper_terminate = mapper_->async_terminate();
@@ -203,6 +212,7 @@ void system::save_keyframe_trajectory(const std::string& path, const std::string
     resume_other_threads();
 }
 
+// 从文件中加载地图数据库
 bool system::load_map_database(const std::string& path) const {
     pause_other_threads();
     spdlog::debug("load_map_database: {}", path);
@@ -234,6 +244,7 @@ const std::shared_ptr<publish::frame_publisher> system::get_frame_publisher() co
     return frame_publisher_;
 }
 
+// 启动映射模块
 void system::enable_mapping_module() {
     std::lock_guard<std::mutex> lock(mtx_mapping_);
     if (!system_is_running_) {
@@ -243,6 +254,7 @@ void system::enable_mapping_module() {
     mapper_->resume();
 }
 
+// 暂停映射模块
 void system::disable_mapping_module() {
     std::lock_guard<std::mutex> lock(mtx_mapping_);
     if (!system_is_running_) {
@@ -254,15 +266,18 @@ void system::disable_mapping_module() {
     future_pause.get();
 }
 
+// 检查映射模块是否已经启动
 bool system::mapping_module_is_enabled() const {
     return !mapper_->is_paused();
 }
 
+// 启动循环检测器
 void system::enable_loop_detector() {
     std::lock_guard<std::mutex> lock(mtx_loop_detector_);
     global_optimizer_->enable_loop_detector();
 }
 
+// 禁用循环检测器
 void system::disable_loop_detector() {
     std::lock_guard<std::mutex> lock(mtx_loop_detector_);
     global_optimizer_->disable_loop_detector();
@@ -288,8 +303,12 @@ void system::enable_temporal_mapping() {
     map_db_->set_fixed_keyframe_id_threshold();
 }
 
-data::frame system::create_monocular_frame(const cv::Mat& img, const double timestamp, const cv::Mat& mask) {
+// 创建一个单目帧
+data::frame system::create_monocular_frame(const cv::Mat& img,      // 单目相机的图像
+                                           const double timestamp,  // 图像时间戳
+                                           const cv::Mat& mask) {   // 用于限制特征提取的图像遮罩
     // color conversion
+    // 将图像转换为灰度图
     if (!camera_->is_valid_shape(img)) {
         spdlog::warn("preprocess: Input image size is invalid");
     }
@@ -299,6 +318,7 @@ data::frame system::create_monocular_frame(const cv::Mat& img, const double time
     data::frame_observation frm_obs;
 
     // Extract ORB feature
+    // 提取 ORB 特征
     keypts_.clear();
     extractor_left_->extract(img_gray, mask, keypts_, frm_obs.descriptors_);
     if (keypts_.empty()) {
@@ -306,23 +326,28 @@ data::frame system::create_monocular_frame(const cv::Mat& img, const double time
     }
 
     // Undistort keypoints
+    // 对关键点去畸变
     camera_->undistort_keypoints(keypts_, frm_obs.undist_keypts_);
 
     // Convert to bearing vector
+    // 将去畸变的关键点转换为方向向量
     camera_->convert_keypoints_to_bearings(frm_obs.undist_keypts_, frm_obs.bearings_);
 
     // Assign all the keypoints into grid
+    // 分配关键点到网格
     frm_obs.num_grid_cols_ = num_grid_cols_;
     frm_obs.num_grid_rows_ = num_grid_rows_;
     data::assign_keypoints_to_grid(camera_, frm_obs.undist_keypts_, frm_obs.keypt_indices_in_cells_,
                                    frm_obs.num_grid_cols_, frm_obs.num_grid_rows_);
 
     // Detect marker
+    // 如果启用了标记检测器，使用标记检测器的detect方法检测图像中的标记，并将结果存储在markers_2d中
     std::unordered_map<unsigned int, data::marker2d> markers_2d;
     if (marker_detector_) {
         marker_detector_->detect(img_gray, markers_2d);
     }
 
+    // 创建单目帧并返回
     return data::frame(next_frame_id_++, timestamp, camera_, orb_params_, frm_obs, std::move(markers_2d));
 }
 
@@ -452,7 +477,11 @@ data::frame system::create_RGBD_frame(const cv::Mat& rgb_img, const cv::Mat& dep
     return data::frame(next_frame_id_++, timestamp, camera_, orb_params_, frm_obs, std::move(markers_2d));
 }
 
-std::shared_ptr<Mat44_t> system::feed_monocular_frame(const cv::Mat& img, const double timestamp, const cv::Mat& mask) {
+// 处理单目帧并传递给系统
+std::shared_ptr<Mat44_t> system::feed_monocular_frame(const cv::Mat& img,       // 单目图像 
+                                                      const double timestamp,   // 图像时间戳
+                                                      const cv::Mat& mask) {    // 限制特征提取的遮罩
+    // 检查是否需要重置系统状态
     check_reset_request();
 
     assert(camera_->setup_type_ == camera::setup_type_t::Monocular);
@@ -460,6 +489,8 @@ std::shared_ptr<Mat44_t> system::feed_monocular_frame(const cv::Mat& img, const 
         spdlog::warn("preprocess: empty image");
         return nullptr;
     }
+
+    // 创建单目帧
     const auto start = std::chrono::system_clock::now();
     auto frm = create_monocular_frame(img, timestamp, mask);
     const auto end = std::chrono::system_clock::now();
@@ -497,7 +528,10 @@ std::shared_ptr<Mat44_t> system::feed_RGBD_frame(const cv::Mat& rgb_img, const c
     return feed_frame(frm, rgb_img, extraction_time_elapsed_ms);
 }
 
-std::shared_ptr<Mat44_t> system::feed_frame(const data::frame& frm, const cv::Mat& img, const double extraction_time_elapsed_ms) {
+// 处理新帧，传递给跟踪模块，返回变换矩阵
+std::shared_ptr<Mat44_t> system::feed_frame(const data::frame& frm,     // 捕获的新帧
+                                            const cv::Mat& img,         // 图像
+                                            const double extraction_time_elapsed_ms) {  // 提取特征所用的时间
     const auto start = std::chrono::system_clock::now();
 
     const auto cam_pose_wc = tracker_->feed_frame(frm);
@@ -505,6 +539,7 @@ std::shared_ptr<Mat44_t> system::feed_frame(const data::frame& frm, const cv::Ma
     const auto end = std::chrono::system_clock::now();
     double tracking_time_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
+    // 更新帧发布器
     frame_publisher_->update(tracker_->curr_frm_.get_landmarks(),
                              !mapper_->is_paused(),
                              tracker_->tracking_state_,
@@ -512,16 +547,25 @@ std::shared_ptr<Mat44_t> system::feed_frame(const data::frame& frm, const cv::Ma
                              img,
                              tracking_time_elapsed_ms,
                              extraction_time_elapsed_ms);
+
+    // 更新地图发布器
     if (tracker_->tracking_state_ == tracker_state_t::Tracking && cam_pose_wc) {
         map_publisher_->set_current_cam_pose(util::converter::inverse_pose(*cam_pose_wc));
     }
 
+    // 返回当前帧在世界坐标系中的位姿
     return cam_pose_wc;
 }
 
+// 通过给定姿态重新定位
 bool system::relocalize_by_pose(const Mat44_t& cam_pose_wc) {
+    // 计算相机坐标系下的姿态
     const Mat44_t cam_pose_cw = util::converter::inverse_pose(cam_pose_wc);
+
+    // 请求重新定位
     bool status = tracker_->request_relocalize_by_pose(cam_pose_cw);
+
+    // 如果重新定位成功，更新地图发布器
     if (status) {
         // Even if state will be lost, still update the pose in map_publisher_
         // to clearly show new camera position

@@ -493,16 +493,19 @@ void tracking_module::update_last_frame() {
     last_frm_.set_pose_cw(last_cam_pose_from_ref_keyfrm_ * last_ref_keyfrm->get_pose_cw());
 }
 
-bool tracking_module::optimize_current_frame_with_local_map(unsigned int& num_tracked_lms,
-                                                            unsigned int& num_reliable_lms,
-                                                            const unsigned int min_num_obs_thr) {
+// 利用局部地图优化当前帧的位姿，并输出地标点的数量
+bool tracking_module::optimize_current_frame_with_local_map(unsigned int& num_tracked_lms,          // 输出跟踪到的地标点数量
+                                                            unsigned int& num_reliable_lms,         // 输出可靠的地标点数量
+                                                            const unsigned int min_num_obs_thr) {   // 最小观测次数阈值
     // optimize the pose
+    // 位姿优化，将优化后的位姿赋值给当前帧
     Mat44_t optimized_pose;
     std::vector<bool> outlier_flags;
     pose_optimizer_->optimize(curr_frm_, optimized_pose, outlier_flags);
     curr_frm_.set_pose_cw(optimized_pose);
 
     // Reject outliers
+    // 去除异常值
     for (unsigned int idx = 0; idx < curr_frm_.frm_obs_.undist_keypts_.size(); ++idx) {
         if (!outlier_flags.at(idx)) {
             continue;
@@ -511,6 +514,7 @@ bool tracking_module::optimize_current_frame_with_local_map(unsigned int& num_tr
     }
 
     // count up the number of tracked landmarks
+    // 计算跟踪到的地标点数量和可靠的地标点数量
     num_tracked_lms = 0;
     num_reliable_lms = 0;
     for (unsigned int idx = 0; idx < curr_frm_.frm_obs_.undist_keypts_.size(); ++idx) {
@@ -538,12 +542,14 @@ bool tracking_module::optimize_current_frame_with_local_map(unsigned int& num_tr
     constexpr unsigned int num_tracked_lms_thr = 20;
 
     // if recently relocalized, use the more strict threshold
+    // 如果最近重新定位了，并且跟踪到的地标数量小于两倍的阈值，则返回false，表示跟踪失败
     if (curr_frm_.timestamp_ < last_reloc_frm_timestamp_ + 1.0 && num_tracked_lms < 2 * num_tracked_lms_thr) {
         spdlog::debug("local map tracking failed: {} matches < {}", num_tracked_lms, 2 * num_tracked_lms_thr);
         return false;
     }
 
     // check the threshold of the number of tracked landmarks
+    // 如果跟踪到的地标数量小于阈值，则返回false，表示跟踪失败
     if (num_tracked_lms < num_tracked_lms_thr) {
         spdlog::debug("local map tracking failed: {} matches < {}", num_tracked_lms, num_tracked_lms_thr);
         return false;
@@ -552,9 +558,11 @@ bool tracking_module::optimize_current_frame_with_local_map(unsigned int& num_tr
     return true;
 }
 
-bool tracking_module::update_local_map(unsigned int fixed_keyframe_id_threshold,
-                                       unsigned int& num_temporal_keyfrms) {
+// 更新局部地图，并设置当前帧的参考关键帧
+bool tracking_module::update_local_map(unsigned int fixed_keyframe_id_threshold,    // 固定关键帧的阈值
+                                       unsigned int& num_temporal_keyfrms) {        // 临时关键帧的数量
     // clean landmark associations
+    // 遍历当前帧中所有去畸变后的点，获取地标点，清除不存在或将要被删除的地标点
     for (unsigned int idx = 0; idx < curr_frm_.frm_obs_.undist_keypts_.size(); ++idx) {
         const auto& lm = curr_frm_.get_landmark(idx);
         if (!lm) {
@@ -567,26 +575,32 @@ bool tracking_module::update_local_map(unsigned int fixed_keyframe_id_threshold,
     }
 
     // acquire the current local map
+    // 根据当前帧的地标点获取当前帧的局部地图
     local_landmarks_.clear();
     auto local_map_updater = module::local_map_updater(max_num_local_keyfrms_);
     if (!local_map_updater.acquire_local_map(curr_frm_.get_landmarks(), fixed_keyframe_id_threshold, num_temporal_keyfrms)) {
         return false;
     }
     // update the variables
+    // 获取最新的局部地图地标和与当前帧最近的共视关键帧
     local_landmarks_ = local_map_updater.get_local_landmarks();
     auto nearest_covisibility = local_map_updater.get_nearest_covisibility();
 
     // update the reference keyframe for the current frame
+    // 更新当前帧的参考关键帧，即最近的共视关键帧
     if (nearest_covisibility) {
         curr_frm_.ref_keyfrm_ = nearest_covisibility;
     }
 
+    // 更新地图数据库
     map_db_->set_local_landmarks(local_landmarks_);
     return true;
 }
 
+// 在局部地图中搜索可重投影的地标，并尝试将这些地标与当前帧进行匹配
 bool tracking_module::search_local_landmarks(unsigned int fixed_keyframe_id_threshold) {
     // select the landmarks which can be reprojected from the ones observed in the current frame
+    // 从当前帧的观测中选择可重投影的地标
     std::unordered_set<unsigned int> curr_landmark_ids;
     for (const auto& lm : curr_frm_.get_landmarks()) {
         if (!lm) {
@@ -604,7 +618,8 @@ bool tracking_module::search_local_landmarks(unsigned int fixed_keyframe_id_thre
         lm->increase_num_observable();
     }
 
-    bool found_proj_candidate = false;
+    // 搜索可重投影的地标候选
+    bool found_proj_candidate = false;  // 是否找到可重投影的地标候选
     // temporary variables
     Vec2_t reproj;
     float x_right;
@@ -612,7 +627,9 @@ bool tracking_module::search_local_landmarks(unsigned int fixed_keyframe_id_thre
     eigen_alloc_unord_map<unsigned int, Vec2_t> lm_to_reproj;
     std::unordered_map<unsigned int, float> lm_to_x_right;
     std::unordered_map<unsigned int, unsigned int> lm_to_scale;
+    // 遍历局部地图所有地标点
     for (const auto& lm : local_landmarks_) {
+        // 如果已经被当前帧观测到了或将要被删除，跳过
         if (curr_landmark_ids.count(lm->id_)) {
             continue;
         }
@@ -636,6 +653,7 @@ bool tracking_module::search_local_landmarks(unsigned int fixed_keyframe_id_thre
         }
 
         // check the observability
+        // 检查地标是否可以被当前帧观测到
         if (curr_frm_.can_observe(lm, 0.5, reproj, x_right, pred_scale_level)) {
             lm_to_reproj[lm->id_] = reproj;
             lm_to_x_right[lm->id_] = x_right;
@@ -648,12 +666,14 @@ bool tracking_module::search_local_landmarks(unsigned int fixed_keyframe_id_thre
         }
     }
 
+    // 如果没有找到可重投影的地标候选，返回 false
     if (!found_proj_candidate) {
         spdlog::warn("projection candidate not found");
         return false;
     }
 
     // acquire more 2D-3D matches by projecting the local landmarks to the current frame
+    // 通过重投影地标获取更多的2D-3D匹配
     match::projection projection_matcher(0.8);
     const float margin = (curr_frm_.id_ < last_reloc_frm_id_ + 2)
                              ? margin_local_map_projection_unstable_
@@ -662,10 +682,12 @@ bool tracking_module::search_local_landmarks(unsigned int fixed_keyframe_id_thre
     return true;
 }
 
-bool tracking_module::new_keyframe_is_needed(unsigned int num_tracked_lms,
-                                             unsigned int num_reliable_lms,
-                                             const unsigned int min_num_obs_thr) const {
+// 判断是否需要创建新的关键帧
+bool tracking_module::new_keyframe_is_needed(unsigned int num_tracked_lms,                  // 跟踪到的地标数量
+                                             unsigned int num_reliable_lms,                 // 可靠的地标数量
+                                             const unsigned int min_num_obs_thr) const {    // 最小观测的阈值
     // cannnot insert the new keyframe in a second after relocalization
+    // 如果当前帧在最近重定位的 1s 内，则不能创建新的关键帧
     if (curr_frm_.timestamp_ < last_reloc_frm_timestamp_ + 1.0) {
         return false;
     }
@@ -674,7 +696,9 @@ bool tracking_module::new_keyframe_is_needed(unsigned int num_tracked_lms,
     return keyfrm_inserter_.new_keyframe_is_needed(map_db_, curr_frm_, num_tracked_lms, num_reliable_lms, *curr_frm_.ref_keyfrm_, min_num_obs_thr);
 }
 
+// 异步停止关键帧插入的过程
 std::future<void> tracking_module::async_stop_keyframe_insertion() {
+    // 使用std::async创建一个异步任务，该任务将在单独的线程上执行
     auto future_stop_keyframe_insertion = std::async(
         std::launch::async,
         [this]() {
@@ -685,6 +709,7 @@ std::future<void> tracking_module::async_stop_keyframe_insertion() {
     return future_stop_keyframe_insertion;
 }
 
+// 异步开始关键帧的插入
 std::future<void> tracking_module::async_start_keyframe_insertion() {
     auto future_stop_keyframe_insertion = std::async(
         std::launch::async,
@@ -696,6 +721,7 @@ std::future<void> tracking_module::async_start_keyframe_insertion() {
     return future_stop_keyframe_insertion;
 }
 
+// 异步请求暂停模块
 std::shared_future<void> tracking_module::async_pause() {
     std::lock_guard<std::mutex> lock(mtx_pause_);
     pause_is_requested_ = true;
@@ -713,16 +739,19 @@ std::shared_future<void> tracking_module::async_pause() {
     return future_pause;
 }
 
+// 检查是否已经请求了暂停模块的执行
 bool tracking_module::pause_is_requested() const {
     std::lock_guard<std::mutex> lock(mtx_pause_);
     return pause_is_requested_;
 }
 
+// 检查模块是否已经暂停
 bool tracking_module::is_paused() const {
     std::lock_guard<std::mutex> lock(mtx_pause_);
     return is_paused_;
 }
 
+// 从暂停状态恢复执行
 void tracking_module::resume() {
     std::lock_guard<std::mutex> lock(mtx_pause_);
 
@@ -732,6 +761,7 @@ void tracking_module::resume() {
     spdlog::info("resume tracking module");
 }
 
+// 检查是否请求了暂停，并在请求暂停时暂停模块的执行
 bool tracking_module::pause_if_requested() {
     std::lock_guard<std::mutex> lock(mtx_pause_);
     if (pause_is_requested_) {
