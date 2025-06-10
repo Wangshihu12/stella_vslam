@@ -123,42 +123,58 @@ void tracking_module::reset() {
 }
 
 std::shared_ptr<Mat44_t> tracking_module::feed_frame(data::frame curr_frm) {
-    // check if pause is requested
+    // 检查是否有暂停请求，如果有则暂停执行
     pause_if_requested();
+    // 如果当前处于暂停状态，则等待直到恢复
     while (is_paused()) {
         std::this_thread::sleep_for(std::chrono::microseconds(5000));
     }
 
+    // 将当前输入帧设置为成员变量，供后续处理使用
     curr_frm_ = curr_frm;
 
     bool succeeded = false;
+    // 根据跟踪状态选择处理方式
     if (tracking_state_ == tracker_state_t::Initializing) {
+        // 如果系统处于初始化状态，尝试进行地图初始化
         succeeded = initialize();
     }
     else {
+        // 如果系统已经初始化完成，进行正常的跟踪流程
+        // 使用互斥锁防止关键帧插入操作的并发冲突
         std::lock_guard<std::mutex> lock(mtx_stop_keyframe_insertion_);
+        
+        // 判断是否需要重定位（当跟踪状态为Lost时）
         bool relocalization_is_needed = tracking_state_ == tracker_state_t::Lost;
         SPDLOG_TRACE("tracking_module: start tracking");
-        unsigned int num_tracked_lms = 0;
-        unsigned int num_reliable_lms = 0;
+        
+        // 初始化跟踪统计变量
+        unsigned int num_tracked_lms = 0;      // 跟踪到的路标点数量
+        unsigned int num_reliable_lms = 0;     // 可靠的路标点数量
+        // 设置最小观测次数阈值：如果关键帧数量>=3则阈值为3，否则为2
         const unsigned int min_num_obs_thr = (3 <= map_db_->get_num_keyframes()) ? 3 : 2;
+        
+        // 执行主要的跟踪逻辑
         succeeded = track(relocalization_is_needed, num_tracked_lms, num_reliable_lms, min_num_obs_thr);
 
-        // check to insert the new keyframe derived from the current frame
+        // 检查是否需要插入新的关键帧
         if (succeeded && !is_stopped_keyframe_insertion_ && new_keyframe_is_needed(num_tracked_lms, num_reliable_lms, min_num_obs_thr)) {
+            // 如果跟踪成功且未停止关键帧插入且满足新关键帧条件，则插入新关键帧
             keyfrm_inserter_.insert_new_keyframe(map_db_, curr_frm_);
         }
     }
 
-    // state transition
+    // 根据跟踪结果进行状态转换
     if (succeeded) {
+        // 跟踪成功，设置状态为正在跟踪
         tracking_state_ = tracker_state_t::Tracking;
     }
     else if (tracking_state_ == tracker_state_t::Tracking) {
+        // 如果之前是跟踪状态但现在失败了，设置为丢失状态
         tracking_state_ = tracker_state_t::Lost;
 
         spdlog::info("tracking lost: frame {}", curr_frm_.id_);
-        // if tracking is failed within init_retry_threshold_time_ sec after initialization, reset the system
+        // 如果在初始化后的短时间内（init_retry_threshold_time_秒内）跟踪失败，重置整个系统
         if (!mapper_->is_paused() && curr_frm_.timestamp_ - initializer_.get_initial_frame_timestamp() < init_retry_threshold_time_) {
             spdlog::info("tracking lost within {} sec after initialization", init_retry_threshold_time_);
             reset();
@@ -167,86 +183,129 @@ std::shared_ptr<Mat44_t> tracking_module::feed_frame(data::frame curr_frm) {
     }
 
     std::shared_ptr<Mat44_t> cam_pose_wc = nullptr;
-    // store the relative pose from the reference keyframe to the current frame
-    // to update the camera pose at the beginning of the next tracking process
+    // 如果当前帧的位姿有效，保存相对位姿信息并创建返回的相机位姿
     if (curr_frm_.pose_is_valid()) {
+        // 计算并保存当前帧相对于参考关键帧的位姿变换
+        // 这个信息将用于下一次跟踪时更新相机位姿
         last_cam_pose_from_ref_keyfrm_ = curr_frm_.get_pose_cw() * curr_frm_.ref_keyfrm_->get_pose_wc();
+        // 创建世界坐标系到相机坐标系的变换矩阵的智能指针
         cam_pose_wc = std::allocate_shared<Mat44_t>(Eigen::aligned_allocator<Mat44_t>(), curr_frm_.get_pose_wc());
     }
 
-    // update last frame
+    // 更新上一帧信息，使用互斥锁保证线程安全
     SPDLOG_TRACE("tracking_module: update last frame (curr_frm_={})", curr_frm_.id_);
     {
         std::lock_guard<std::mutex> lock(mtx_last_frm_);
-        last_frm_ = curr_frm_;
+        last_frm_ = curr_frm_;  // 将当前帧保存为上一帧，供下次跟踪使用
     }
     SPDLOG_TRACE("tracking_module: finish tracking");
 
+    // 返回相机位姿（如果跟踪成功）或nullptr（如果跟踪失败）
     return cam_pose_wc;
 }
 
+// 跟踪函数：这是整个跟踪模块的核心函数，负责处理当前帧的跟踪逻辑
+// 参数说明：
+// - relocalization_is_needed: 是否需要重定位（当跟踪丢失时为true）
+// - num_tracked_lms: 输出参数，记录成功跟踪到的路标点数量
+// - num_reliable_lms: 输出参数，记录可靠的路标点数量（观测次数足够多）
+// - min_num_obs_thr: 最小观测次数阈值，用于判断路标点是否可靠
 bool tracking_module::track(bool relocalization_is_needed,
                             unsigned int& num_tracked_lms,
                             unsigned int& num_reliable_lms,
                             const unsigned int min_num_obs_thr) {
-    // LOCK the map database
+    
+    // 第一步：加锁保护共享资源
+    // lock1: 锁定地图数据库，防止在跟踪过程中其他线程修改地图数据
     std::lock_guard<std::mutex> lock1(data::map_database::mtx_database_);
+    // lock2: 锁定上一帧数据，防止并发访问冲突 
     std::lock_guard<std::mutex> lock2(mtx_last_frm_);
 
-    // update the camera pose of the last frame
-    // because the mapping module might optimize the camera pose of the last frame's reference keyframe
+    // 第二步：更新上一帧的相机位姿
+    // 由于建图模块可能会优化上一帧参考关键帧的位姿，所以需要更新上一帧的相机位姿
+    // 这确保了跟踪使用的是最新优化后的位姿信息
     SPDLOG_TRACE("tracking_module: update the camera pose of the last frame (curr_frm_={})", curr_frm_.id_);
     update_last_frame();
 
-    // set the reference keyframe of the current frame
+    // 第三步：设置当前帧的参考关键帧
+    // 将上一帧的参考关键帧作为当前帧的参考关键帧
+    // 参考关键帧用于计算相对位姿变换
     curr_frm_.ref_keyfrm_ = last_frm_.ref_keyfrm_;
 
-    bool succeeded = false;
+    // 第四步：根据不同情况选择跟踪策略
+    bool succeeded = false;  // 跟踪成功标志
+    
+    // 策略1：强制基于位姿的重定位
+    // 如果存在BoW数据库且有外部位姿重定位请求，则执行强制重定位
     if (bow_db_ && relocalize_by_pose_is_requested()) {
-        // Force relocalization by pose
+        // 使用外部提供的位姿进行强制重定位
+        // 这通常用于手动指定相机位置或从外部传感器获得位姿信息的情况
         succeeded = relocalize_by_pose(get_relocalize_by_pose_request());
     }
+    // 策略2：正常跟踪模式
+    // 如果不需要重定位，则使用正常的帧间跟踪
     else if (!relocalization_is_needed) {
         SPDLOG_TRACE("tracking_module: track_current_frame (curr_frm_={})", curr_frm_.id_);
+        // 基于运动模型、BoW匹配或特征匹配进行帧间跟踪
         succeeded = track_current_frame();
     }
+    // 策略3：自动重定位模式
+    // 如果跟踪丢失且启用了自动重定位功能，则尝试重定位
     else if (bow_db_ && enable_auto_relocalization_) {
-        // Compute the BoW representations to perform relocalization
+        // 计算当前帧的BoW表示，用于与关键帧数据库进行匹配
         SPDLOG_TRACE("tracking_module: Compute the BoW representations to perform relocalization (curr_frm_={})", curr_frm_.id_);
         if (!curr_frm_.bow_is_available()) {
+            // 如果当前帧还没有计算BoW特征，则先计算
             curr_frm_.compute_bow(bow_vocab_);
         }
-        // try to relocalize
+        
+        // 尝试通过BoW数据库进行重定位
         SPDLOG_TRACE("tracking_module: try to relocalize (curr_frm_={})", curr_frm_.id_);
         succeeded = relocalizer_.relocalize(bow_db_, curr_frm_);
+        
+        // 如果重定位成功，记录重定位信息
         if (succeeded) {
-            last_reloc_frm_id_ = curr_frm_.id_;
-            last_reloc_frm_timestamp_ = curr_frm_.timestamp_;
+            last_reloc_frm_id_ = curr_frm_.id_;           // 记录重定位的帧ID
+            last_reloc_frm_timestamp_ = curr_frm_.timestamp_;  // 记录重定位的时间戳
         }
     }
 
-    // update the local map and optimize current camera pose
+    // 第五步：局部地图跟踪和位姿优化
+    // 获取固定关键帧ID阈值，用于区分固定关键帧和临时关键帧
     unsigned int fixed_keyframe_id_threshold = map_db_->get_fixed_keyframe_id_threshold();
-    unsigned int num_temporal_keyfrms = 0;
+    unsigned int num_temporal_keyfrms = 0;  // 临时关键帧数量
+    
+    // 如果前面的跟踪步骤成功，则进行局部地图跟踪
     if (succeeded) {
-        succeeded = track_local_map(num_tracked_lms, num_reliable_lms, num_temporal_keyfrms, min_num_obs_thr, fixed_keyframe_id_threshold);
+        // 更新局部地图，搜索局部路标点，并优化当前帧位姿
+        // 这一步会找到更多的特征匹配，提高跟踪的鲁棒性
+        succeeded = track_local_map(num_tracked_lms, num_reliable_lms, num_temporal_keyfrms, 
+                                   min_num_obs_thr, fixed_keyframe_id_threshold);
     }
 
-    // update the local map and optimize current camera pose without temporal keyframes
+    // 第六步：不包含临时关键帧的局部地图跟踪
+    // 如果存在固定关键帧阈值、跟踪成功且有临时关键帧，则进行第二次优化
+    // 这次优化排除临时关键帧，只使用更稳定的固定关键帧
     if (fixed_keyframe_id_threshold > 0 && succeeded && num_temporal_keyfrms > 0) {
-        succeeded = track_local_map_without_temporal_keyframes(num_tracked_lms, num_reliable_lms, min_num_obs_thr, fixed_keyframe_id_threshold);
+        succeeded = track_local_map_without_temporal_keyframes(num_tracked_lms, num_reliable_lms, 
+                                                              min_num_obs_thr, fixed_keyframe_id_threshold);
     }
 
-    // update the motion model
+    // 第七步：更新运动模型
+    // 如果跟踪成功，则计算当前帧和上一帧之间的位姿变换
+    // 这个运动模型将用于下一帧的初始位姿预测
     if (succeeded) {
         SPDLOG_TRACE("tracking_module: update_motion_model (curr_frm_={})", curr_frm_.id_);
         update_motion_model();
     }
 
-    // update the frame statistics
+    // 第八步：更新帧统计信息
+    // 记录当前帧的跟踪状态和统计数据到地图数据库
+    // 这些信息用于后续的关键帧选择和地图优化决策
     SPDLOG_TRACE("tracking_module: update_frame_statistics (curr_frm_={})", curr_frm_.id_);
-    map_db_->update_frame_statistics(curr_frm_, !succeeded);
+    map_db_->update_frame_statistics(curr_frm_, !succeeded);  // 第二个参数表示是否跟踪失败
 
+    // 返回跟踪是否成功
     return succeeded;
 }
 
@@ -330,27 +389,58 @@ bool tracking_module::initialize() {
     return true;
 }
 
+// 当前帧跟踪函数：这是正常跟踪模式下的核心函数
+// 该函数实现了三种不同的跟踪策略，按照从快到慢、从简单到复杂的顺序依次尝试
+// 只有当前一种方法失败时，才会尝试下一种方法，这样可以平衡跟踪速度和鲁棒性
 bool tracking_module::track_current_frame() {
-    bool succeeded = false;
+    bool succeeded = false;  // 跟踪成功标志
 
-    // Tracking mode
+    // 策略1：基于运动模型的跟踪（最快速的方法）
+    // 前提条件：运动模型有效（即能够预测相机的运动趋势）
     if (twist_is_valid_) {
-        // if the motion model is valid
+        // 使用运动模型进行跟踪
+        // twist_ 是从上一帧到当前帧的位姿变换矩阵（运动模型）
+        // 这种方法假设相机运动具有连续性，通过预测下一帧位姿来进行特征匹配
+        // 适用于相机运动平滑、帧率较高的场景
         succeeded = frame_tracker_.motion_based_track(curr_frm_, last_frm_, twist_);
     }
+    
+    // 策略2：基于BoW（词袋模型）的跟踪（中等速度的方法）
+    // 如果运动模型跟踪失败，尝试使用BoW特征进行匹配
     if (!succeeded) {
-        // Compute the BoW representations to perform the BoW match
+        // 首先确保当前帧的BoW特征已经计算
+        // BoW特征是将图像特征描述子量化到视觉词典中的表示方法
         if (bow_vocab_ && !curr_frm_.bow_is_available()) {
+            // 如果存在BoW词典且当前帧还没有计算BoW特征，则先计算
             curr_frm_.compute_bow(bow_vocab_);
         }
+        
+        // 进行BoW匹配跟踪的前提条件：
+        // 1. 当前帧有BoW特征表示
+        // 2. 参考关键帧也有BoW特征表示
         if (curr_frm_.bow_is_available() && curr_frm_.ref_keyfrm_->bow_is_available()) {
+            // 使用BoW特征进行帧间跟踪
+            // 这种方法通过比较当前帧和参考关键帧的BoW特征来建立特征对应关系
+            // 相比运动模型，这种方法对相机运动的连续性要求较低
+            // 但计算量比运动模型跟踪大，速度较慢
             succeeded = frame_tracker_.bow_match_based_track(curr_frm_, last_frm_, curr_frm_.ref_keyfrm_);
         }
     }
+    
+    // 策略3：基于鲁棒匹配的跟踪（最慢但最鲁棒的方法）
+    // 如果前两种方法都失败，使用最鲁棒但最耗时的匹配方法
     if (!succeeded) {
+        // 使用鲁棒匹配进行跟踪
+        // 这种方法不依赖于运动模型或BoW特征，而是直接进行特征描述子匹配
+        // 通常使用更严格的匹配策略和异常值检测机制
+        // 虽然计算量最大、速度最慢，但在困难场景下具有最好的鲁棒性
+        // 适用于相机运动剧烈、纹理较少或光照变化较大的场景
         succeeded = frame_tracker_.robust_match_based_track(curr_frm_, last_frm_, curr_frm_.ref_keyfrm_);
     }
 
+    // 返回跟踪结果
+    // true: 至少有一种跟踪策略成功，当前帧位姿估计有效
+    // false: 所有跟踪策略都失败，需要进入重定位模式
     return succeeded;
 }
 
@@ -530,80 +620,127 @@ bool tracking_module::update_local_map(unsigned int fixed_keyframe_id_threshold,
     return true;
 }
 
+// 搜索局部路标点函数：在局部地图中寻找可以投影到当前帧的路标点
+// 这是局部地图跟踪的核心步骤之一，用于增加当前帧与地图点的匹配数量
+// 参数 fixed_keyframe_id_threshold: 固定关键帧ID阈值，用于区分固定关键帧和临时关键帧
 bool tracking_module::search_local_landmarks(unsigned int fixed_keyframe_id_threshold) {
-    // select the landmarks which can be reprojected from the ones observed in the current frame
+    
+    // 第一步：收集当前帧中已经观测到的路标点ID
+    // 这样做是为了避免重复投影已经在当前帧中观测到的路标点
     std::unordered_set<unsigned int> curr_landmark_ids;
+    
+    // 遍历当前帧中所有已经观测到的路标点
     for (const auto& lm : curr_frm_.get_landmarks()) {
+        // 跳过空指针路标点
         if (!lm) {
             continue;
         }
+        // 跳过即将被删除的路标点
+        // 这些路标点在优化过程中被标记为异常值或质量不佳
         if (lm->will_be_erased()) {
             continue;
         }
 
-        // this landmark cannot be reprojected
-        // because already observed in the current frame
+        // 记录这个路标点的ID，表示它不能被重新投影
+        // 因为它已经在当前帧中被观测到了
         curr_landmark_ids.insert(lm->id_);
 
-        // this landmark is observable from the current frame
+        // 增加该路标点的可观测次数统计
+        // 这个统计信息用于评估路标点的质量和可靠性
         lm->increase_num_observable();
     }
 
-    bool found_proj_candidate = false;
-    // temporary variables
-    Vec2_t reproj;
-    float x_right;
-    unsigned int pred_scale_level;
-    eigen_alloc_unord_map<unsigned int, Vec2_t> lm_to_reproj;
-    std::unordered_map<unsigned int, float> lm_to_x_right;
-    std::unordered_map<unsigned int, unsigned int> lm_to_scale;
+    // 第二步：准备投影匹配的相关变量
+    bool found_proj_candidate = false;  // 是否找到可投影的候选路标点
+    
+    // 临时变量，用于存储投影计算结果
+    Vec2_t reproj;                      // 重投影坐标
+    float x_right;                      // 右相机的x坐标（双目相机使用）
+    unsigned int pred_scale_level;      // 预测的尺度层级
+    
+    // 存储路标点投影信息的映射表
+    eigen_alloc_unord_map<unsigned int, Vec2_t> lm_to_reproj;      // 路标点ID -> 投影坐标
+    std::unordered_map<unsigned int, float> lm_to_x_right;         // 路标点ID -> 右相机x坐标
+    std::unordered_map<unsigned int, unsigned int> lm_to_scale;    // 路标点ID -> 尺度层级
+    
+    // 第三步：遍历所有局部路标点，寻找可投影的候选点
     for (const auto& lm : local_landmarks_) {
+        // 跳过已经在当前帧中观测到的路标点
         if (curr_landmark_ids.count(lm->id_)) {
             continue;
         }
+        // 跳过即将被删除的路标点
         if (lm->will_be_erased()) {
             continue;
         }
+        
+        // 第四步：处理固定关键帧阈值的约束
+        // 如果设置了固定关键帧阈值，需要过滤掉主要由临时关键帧观测到的路标点
         if (fixed_keyframe_id_threshold > 0) {
+            // 获取该路标点的所有观测信息
             const auto observations = lm->get_observations();
-            unsigned int temporal_observations = 0;
+            unsigned int temporal_observations = 0;  // 临时关键帧观测次数
+            
+            // 统计有多少观测来自临时关键帧（ID >= 阈值的关键帧）
             for (auto obs : observations) {
-                auto keyfrm = obs.first.lock();
+                auto keyfrm = obs.first.lock();  // 获取观测到该路标点的关键帧
                 if (keyfrm->id_ >= fixed_keyframe_id_threshold) {
                     ++temporal_observations;
                 }
             }
-            const double temporal_ratio_thr = 0.5;
+            
+            // 计算临时关键帧观测的比例
+            const double temporal_ratio_thr = 0.5;  // 临时观测比例阈值（50%）
             double temporal_ratio = static_cast<double>(temporal_observations) / observations.size();
+            
+            // 如果临时观测比例过高，跳过这个路标点
+            // 这样做是为了优先使用由固定关键帧观测到的更稳定的路标点
             if (temporal_ratio > temporal_ratio_thr) {
                 continue;
             }
         }
 
-        // check the observability
+        // 第五步：检查路标点的可观测性
+        // 判断该路标点是否可以从当前帧的视角观测到
+        // 参数0.5是视角阈值，用于判断观测角度是否合适
         if (curr_frm_.can_observe(lm, 0.5, reproj, x_right, pred_scale_level)) {
-            lm_to_reproj[lm->id_] = reproj;
-            lm_to_x_right[lm->id_] = x_right;
-            lm_to_scale[lm->id_] = pred_scale_level;
+            // 如果可以观测到，保存投影信息
+            lm_to_reproj[lm->id_] = reproj;           // 保存投影坐标
+            lm_to_x_right[lm->id_] = x_right;         // 保存右相机坐标（双目用）
+            lm_to_scale[lm->id_] = pred_scale_level;  // 保存预测的尺度层级
 
-            // this landmark is observable from the current frame
+            // 增加该路标点的可观测次数统计
             lm->increase_num_observable();
 
+            // 标记找到了可投影的候选点
             found_proj_candidate = true;
         }
     }
 
+    // 第六步：检查是否找到了候选投影点
     if (!found_proj_candidate) {
+        // 如果没有找到任何可投影的路标点，输出警告并返回失败
         spdlog::warn("projection candidate not found");
         return false;
     }
 
-    // acquire more 2D-3D matches by projecting the local landmarks to the current frame
+    // 第七步：执行投影匹配
+    // 创建投影匹配器，参数0.8是匹配阈值（越小越严格）
     match::projection projection_matcher(0.8);
+    
+    // 根据当前帧是否在重定位后的不稳定期来设置投影边界
+    // 如果是重定位后的前2帧，使用更大的搜索边界以提高匹配成功率
     const float margin = (curr_frm_.id_ < last_reloc_frm_id_ + 2)
-                             ? margin_local_map_projection_unstable_
-                             : margin_local_map_projection_;
-    projection_matcher.match_frame_and_landmarks(curr_frm_, local_landmarks_, lm_to_reproj, lm_to_x_right, lm_to_scale, margin);
+                             ? margin_local_map_projection_unstable_  // 不稳定期的大边界
+                             : margin_local_map_projection_;          // 正常的小边界
+    
+    // 执行帧与路标点的投影匹配
+    // 这一步会在当前帧中寻找与局部路标点对应的特征点
+    // 成功的匹配会建立新的2D-3D对应关系，增强跟踪的鲁棒性
+    projection_matcher.match_frame_and_landmarks(curr_frm_, local_landmarks_, 
+                                                lm_to_reproj, lm_to_x_right, lm_to_scale, margin);
+    
+    // 返回成功
     return true;
 }
 
