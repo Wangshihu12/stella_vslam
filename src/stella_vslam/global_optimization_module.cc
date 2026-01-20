@@ -85,114 +85,149 @@ void global_optimization_module::finish_loop_closure_request() {
     loop_closure_is_requested_ = false;
 }
 
+/**
+ * [功能描述]：执行回环闭合操作，处理回环检测请求并进行回环校正
+ * @param request：回环闭合请求，包含两个可能形成回环的关键帧ID（keyfrm1_id_ 和 keyfrm2_id_）
+ * @return bool：回环闭合是否成功，true 表示成功执行回环校正，false 表示回环检测失败或关键帧无效
+ */
 bool global_optimization_module::loop_closure(const loop_closure_request& request) {
     {
+        // 加锁保护地图数据库，防止在回环检测和校正期间数据被修改
         std::lock_guard<std::mutex> lock(data::map_database::mtx_database_);
+
+        // 从请求中获取当前关键帧ID（较大的ID，即较新的帧）和候选关键帧ID（较小的ID，即较旧的帧）
         unsigned int curr_keyfrm_id = std::max(request.keyfrm1_id_, request.keyfrm2_id_);
         unsigned int candidate_keyfrm_id = std::min(request.keyfrm1_id_, request.keyfrm2_id_);
-        // not to be removed during loop detection and correction
+
+        // 从地图数据库中获取当前关键帧，确保在回环检测和校正期间不被删除
         cur_keyfrm_ = map_db_->get_keyframe(curr_keyfrm_id);
         if (cur_keyfrm_ == nullptr) {
+            // 当前关键帧不存在，记录日志并返回失败
             spdlog::info("keyframe {} not found", curr_keyfrm_id);
             return false;
         }
+        // 设置当前关键帧不可删除，防止在回环处理过程中被意外移除
         cur_keyfrm_->set_not_to_be_erased();
+        // 将当前关键帧设置到回环检测器中
         loop_detector_->set_current_keyframe(cur_keyfrm_);
+
+        // 从地图数据库中获取候选关键帧（潜在的回环帧）
         auto candidate_keyfrm = map_db_->get_keyframe(candidate_keyfrm_id);
         if (candidate_keyfrm == nullptr) {
+            // 候选关键帧不存在，记录日志并返回失败
             spdlog::info("candidate keyframe {} not found", candidate_keyfrm_id);
             return false;
         }
+        // 将候选关键帧添加到回环检测器的候选列表中
         loop_detector_->add_loop_candidate(candidate_keyfrm);
 
-        // validate candidates and select ONE candidate from them
+        // 验证候选帧并从中选择一个有效的回环候选
         if (!loop_detector_->validate_candidates()) {
-            // could not find
-            // allow the removal of the current keyframe
+            // 验证失败，未找到有效的回环候选
+            // 允许删除当前关键帧（恢复其可删除状态）
             cur_keyfrm_->set_to_be_erased();
             return false;
         }
     }
+    // 锁释放后执行回环校正（包括位姿图优化和地图点融合）
 
+    // 执行回环校正，修正累积漂移误差
     correct_loop();
+    // 完成回环闭合请求的后续处理
     finish_loop_closure_request();
     return true;
 }
 
+/**
+ * [功能描述]：全局优化模块的主运行循环
+ *            负责处理关键帧队列、执行回环检测和回环校正
+ *            该函数在独立线程中运行，持续监控并处理回环闭合任务
+ */
 void global_optimization_module::run() {
     spdlog::info("start global optimization module");
 
+    // 初始化终止标志为false，表示模块正在运行
     is_terminated_ = false;
 
+    // 主循环：持续运行直到收到终止请求
     while (true) {
+        // 每次循环休眠5ms，降低CPU占用率
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-        // check if termination is requested
+        // ==================== 检查终止请求 ====================
         if (terminate_is_requested()) {
-            // terminate and break
+            // 收到终止请求，执行终止操作并退出循环
             terminate();
             break;
         }
 
-        // check if loop closure is requested
+        // ==================== 检查外部回环闭合请求 ====================
+        // 处理来自外部的显式回环闭合请求（如用户指定的回环）
         if (loop_closure_is_requested()) {
             loop_closure(get_loop_closure_request());
         }
 
-        // check if pause is requested
+        // ==================== 检查暂停请求 ====================
         if (pause_is_requested()) {
-            // pause and wait
+            // 执行暂停操作
             pause();
-            // check if termination or reset is requested during pause
+            // 暂停期间持续等待，直到收到终止或重置请求
             while (is_paused() && !terminate_is_requested() && !reset_is_requested()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(3));
             }
         }
 
-        // check if reset is requested
+        // ==================== 检查重置请求 ====================
         if (reset_is_requested()) {
-            // reset and continue
+            // 执行重置操作（清空队列、重置状态等）
             reset();
             continue;
         }
 
-        // if the queue is empty, the following process is not needed
+        // ==================== 检查关键帧队列 ====================
+        // 如果队列为空，跳过后续处理，继续下一次循环
         if (!keyframe_is_queued()) {
             continue;
         }
 
-        // dequeue the keyframe from the queue -> cur_keyfrm_
+        // ==================== 从队列中取出关键帧 ====================
         {
+            // 加锁保护关键帧队列
             std::lock_guard<std::mutex> lock(mtx_keyfrm_queue_);
+            // 取出队首关键帧作为当前处理帧
             cur_keyfrm_ = keyfrms_queue_.front();
+            // 将该关键帧从队列中移除
             keyfrms_queue_.pop_front();
         }
 
+        // ==================== 执行回环检测 ====================
         {
+            // 加锁保护地图数据库
             std::lock_guard<std::mutex> lock(data::map_database::mtx_database_);
-            // not to be removed during loop detection and correction
+
+            // 设置当前关键帧不可删除，确保在回环检测和校正期间不被移除
             cur_keyfrm_->set_not_to_be_erased();
 
-            // pass the current keyframe to the loop detector
+            // 将当前关键帧传递给回环检测器
             loop_detector_->set_current_keyframe(cur_keyfrm_);
 
-            // detect some loop candidate with BoW
+            // 使用词袋模型（BoW）检测回环候选帧
             if (!loop_detector_->detect_loop_candidates()) {
-                // could not find
-                // allow the removal of the current keyframe
+                // 未找到回环候选，允许删除当前关键帧
                 cur_keyfrm_->set_to_be_erased();
                 continue;
             }
 
-            // validate candidates and select ONE candidate from them
+            // 验证候选帧并从中选择一个有效的回环帧
             if (!loop_detector_->validate_candidates()) {
-                // could not find
-                // allow the removal of the current keyframe
+                // 验证失败，未找到有效回环，允许删除当前关键帧
                 cur_keyfrm_->set_to_be_erased();
                 continue;
             }
         }
 
+        // ==================== 执行回环校正 ====================
+        // 回环检测成功，执行回环校正（位姿优化、路标点融合等）
         correct_loop();
     }
 
@@ -209,105 +244,126 @@ bool global_optimization_module::keyframe_is_queued() const {
     return !keyfrms_queue_.empty();
 }
 
+/**
+ * [功能描述]：执行回环校正，修正由于累积漂移导致的位姿误差
+ *            该函数是回环闭合的核心，包含位姿校正、路标点融合、位姿图优化和全局BA等步骤
+ */
 void global_optimization_module::correct_loop() {
+    // 获取经过验证的最终回环候选关键帧
     auto final_candidate_keyfrm = loop_detector_->get_selected_candidate_keyframe();
 
+    // 输出检测到的回环信息：候选帧ID和当前帧ID
     spdlog::info("detect loop: keyframe {} - keyframe {}", final_candidate_keyfrm->id_, cur_keyfrm_->id_);
 
+    // 检查当前帧和候选帧是否属于同一个生成树
+    // 如果不是同一棵树，则无法进行回环校正（合并两棵生成树的功能尚未实现）
     if (cur_keyfrm_->graph_node_->get_spanning_root() != final_candidate_keyfrm->graph_node_->get_spanning_root()) {
         spdlog::warn("The feature to merge two spanning trees has not yet been implemented.");
         return;
     }
 
-    // 0. pre-processing
+    // ==================== 步骤0：预处理 ====================
+    // 0-1. 暂停建图模块和之前的回环BA优化器
 
-    // 0-1. stop the mapping module and the previous loop bundle adjuster
-
-    // pause the mapping module
+    // 异步请求暂停建图模块，避免在回环校正期间产生新的关键帧和路标点
     SPDLOG_TRACE("global_optimization_module: pause the mapping module");
     auto future_pause = mapper_->async_pause();
-    // abort the previous loop bundle adjuster
+
+    // 如果之前的回环BA线程存在或正在运行，则中止它
     if (thread_for_loop_BA_ || loop_bundle_adjuster_->is_running()) {
         SPDLOG_TRACE("global_optimization_module: abort loop bundle adjustment");
         abort_loop_BA();
     }
-    // wait till the mapping module pauses
+    // 等待建图模块完全暂停
     future_pause.get();
 
-    // 1. compute the Sim3 of the covisibilities of the current keyframe whose Sim3 is already estimated by the loop detector
-    //    then, the covisibilities are moved to the corrected positions
-    //    finally, landmarks observed in them are also moved to the correct position using the camera poses before and after camera pose correction
+    // ==================== 步骤1：计算并校正共视关键帧的Sim3变换 ====================
+    // 计算当前关键帧共视帧的Sim3变换（回环检测器已估计出当前帧的Sim3）
+    // 然后将共视帧移动到校正后的位置
+    // 最后使用校正前后的相机位姿将观测到的路标点也移动到正确位置
 
     SPDLOG_TRACE("global_optimization_module: compute the Sim3 of the covisibilities of the current keyframe whose Sim3 is already estimated by the loop detector");
-    // acquire the covisibilities of the current keyframe
+
+    // 获取当前关键帧的共视关键帧（共享路标点数量超过阈值的帧）
     std::vector<std::shared_ptr<data::keyframe>> curr_neighbors = cur_keyfrm_->graph_node_->get_covisibilities_over_min_num_shared_lms(thr_neighbor_keyframes_);
+    // 将当前关键帧也加入共视帧列表
     curr_neighbors.push_back(cur_keyfrm_);
 
-    // Sim3 camera poses BEFORE loop correction
+    // 存储回环校正前的Sim3相机位姿（从世界坐标系到相机坐标系的变换）
     module::keyframe_Sim3_pairs_t Sim3s_nw_before_correction;
-    // Sim3 camera poses AFTER loop correction
+    // 存储回环校正后的Sim3相机位姿
     module::keyframe_Sim3_pairs_t Sim3s_nw_after_correction;
 
+    // 存储找到的路标点ID到参考关键帧ID的映射
     std::unordered_map<unsigned int, unsigned int> found_lm_to_ref_keyfrm_id;
+    // 获取回环检测器计算的校正后的Sim3变换（世界坐标系到当前帧）
     const auto g2o_Sim3_cw_after_correction = loop_detector_->get_Sim3_world_to_current();
     {
+        // 加锁保护地图数据库
         std::lock_guard<std::mutex> lock(data::map_database::mtx_database_);
 
-        // camera pose of the current keyframe BEFORE loop correction
+        // 获取回环校正前当前关键帧的相机位姿（从相机坐标系到世界坐标系）
         const Mat44_t cam_pose_wc_before_correction = cur_keyfrm_->get_pose_wc();
 
-        // compute Sim3s BEFORE loop correction
+        // 计算所有共视帧在回环校正前的Sim3位姿
         Sim3s_nw_before_correction = get_Sim3s_before_loop_correction(curr_neighbors);
-        // compute Sim3s AFTER loop correction
+        // 计算所有共视帧在回环校正后的Sim3位姿（基于当前帧的校正量传播到共视帧）
         Sim3s_nw_after_correction = get_Sim3s_after_loop_correction(cam_pose_wc_before_correction, g2o_Sim3_cw_after_correction, curr_neighbors);
 
-        // correct covibisibility landmark positions
+        // 校正共视帧观测到的路标点位置
         correct_covisibility_landmarks(Sim3s_nw_before_correction, Sim3s_nw_after_correction, found_lm_to_ref_keyfrm_id);
-        // correct covisibility keyframe camera poses
+        // 校正共视关键帧的相机位姿
         correct_covisibility_keyframes(Sim3s_nw_after_correction);
     }
 
-    // 2. resolve duplications of landmarks caused by loop fusion
+    // ==================== 步骤2：解决回环融合导致的路标点重复问题 ====================
 
     SPDLOG_TRACE("global_optimization_module: resolve duplications of landmarks caused by loop fusion");
+    // 获取当前帧与候选帧匹配的路标点
     const auto curr_match_lms_observed_in_cand = loop_detector_->current_matched_landmarks_observed_in_candidate();
+    // 替换重复的路标点（将当前帧观测到的点与候选帧的对应点融合）
     replace_duplicated_landmarks(curr_match_lms_observed_in_cand, Sim3s_nw_after_correction);
 
-    // 3. extract the new connections created after loop fusion
+    // ==================== 步骤3：提取回环融合后创建的新连接 ====================
 
     SPDLOG_TRACE("global_optimization_module: extract the new connections created after loop fusion");
+    // 提取因路标点融合而产生的新的共视关系
     const auto new_connections = extract_new_connections(curr_neighbors);
 
-    // 4. pose graph optimization
+    // ==================== 步骤4：位姿图优化 ====================
 
     SPDLOG_TRACE("global_optimization_module: pose graph optimization");
+    // 执行位姿图优化，优化所有关键帧的位姿以满足新的回环约束
     graph_optimizer_->optimize(final_candidate_keyfrm, cur_keyfrm_, Sim3s_nw_before_correction, Sim3s_nw_after_correction, new_connections, found_lm_to_ref_keyfrm_id);
 
-    // add a loop edge
+    // 在候选帧和当前帧之间添加双向回环边，建立回环约束关系
     final_candidate_keyfrm->graph_node_->add_loop_edge(cur_keyfrm_);
     cur_keyfrm_->graph_node_->add_loop_edge(final_candidate_keyfrm);
 
-    // 5. launch loop BA
+    // ==================== 步骤5：启动回环BA（全局光束法平差） ====================
 
     SPDLOG_TRACE("global_optimization_module: wait for loop BA");
+    // 等待之前的回环BA完成
     while (loop_bundle_adjuster_->is_running()) {
         std::this_thread::sleep_for(std::chrono::microseconds(1000));
     }
+    // 如果之前的BA线程存在，等待其结束并释放资源
     if (thread_for_loop_BA_) {
         SPDLOG_TRACE("global_optimization_module: wait for last loop BA");
         thread_for_loop_BA_->join();
         thread_for_loop_BA_.reset(nullptr);
     }
+    // 在新线程中启动回环BA优化，进一步优化所有关键帧位姿和路标点位置
     SPDLOG_TRACE("global_optimization_module: launch loop BA");
     thread_for_loop_BA_ = std::unique_ptr<std::thread>(new std::thread(&module::loop_bundle_adjuster::optimize, loop_bundle_adjuster_.get(), cur_keyfrm_));
 
-    // 6. post-processing
+    // ==================== 步骤6：后处理 ====================
 
     SPDLOG_TRACE("global_optimization_module: resume the mapping module");
-    // resume the mapping module
+    // 恢复建图模块的运行
     mapper_->resume();
 
-    // set the loop fusion information to the loop detector
+    // 将当前帧ID记录为最近一次回环校正的关键帧ID
     loop_detector_->set_loop_correct_keyframe_id(cur_keyfrm_->id_);
 }
 
